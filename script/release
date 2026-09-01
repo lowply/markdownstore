@@ -1,0 +1,30 @@
+#!/bin/sh
+
+set -eu
+
+current_tag=$(git tag --sort=-version:refname | sed -n '1p')
+
+if [ -n "$current_tag" ]; then
+  printf 'Current tag: %s\n' "$current_tag"
+else
+  printf 'Current tag: (none)\n'
+fi
+
+printf 'New tag: '
+if ! IFS= read -r new_tag; then
+  printf '\nError: failed to read the new tag.\n' >&2
+  exit 1
+fi
+
+if [ -z "$new_tag" ]; then
+  printf 'Error: the new tag cannot be empty.\n' >&2
+  exit 1
+fi
+
+if git rev-parse --quiet --verify "refs/tags/$new_tag" >/dev/null; then
+  printf 'Error: tag %s already exists.\n' "$new_tag" >&2
+  exit 1
+fi
+
+git tag --sign --message '' "$new_tag"
+git push origin "refs/tags/$new_tag"
