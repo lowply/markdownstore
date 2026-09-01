@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -18,57 +19,74 @@ import (
 
 type testCodec struct{}
 
-type testMetadata struct {
-	ID         string `json:"id"`
-	Repository string `json:"repository"`
-	Name       string `json:"name"`
-	Summary    string `json:"summary"`
-	Status     string `json:"status"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+type testFrontmatter struct {
+	ID       string            `json:"id"`
+	Metadata map[string]string `json:"metadata"`
 }
 
-func (testCodec) Parse(_ string, frontmatter, body []byte) (Record, error) {
-	var metadata testMetadata
-	if err := json.Unmarshal(frontmatter, &metadata); err != nil {
-		return Record{}, err
+func (testCodec) Parse(_ string, frontmatter, body []byte) (Document, error) {
+	var parsed testFrontmatter
+	if err := json.Unmarshal(frontmatter, &parsed); err != nil {
+		return Document{}, err
 	}
-	return Record{
-		ID: metadata.ID, Repository: metadata.Repository, Name: metadata.Name,
-		Summary: metadata.Summary, Body: string(body), SearchText: string(body),
-		Status: metadata.Status, CreatedAt: metadata.CreatedAt, UpdatedAt: metadata.UpdatedAt,
+	metadata := parsed.Metadata
+	return Document{
+		ID: parsed.ID, Metadata: metadata, Body: string(body),
+		SortKey: metadata["created_at"],
+		SearchSlots: []string{
+			metadata["repository"], metadata["name"], metadata["summary"], string(body),
+		},
 	}, nil
 }
 
-func (testCodec) Marshal(record Record) ([]byte, error) {
-	frontmatter, err := json.Marshal(testMetadata{
-		ID: record.ID, Repository: record.Repository, Name: record.Name,
-		Summary: record.Summary, Status: record.Status,
-		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+func (testCodec) Marshal(document Document) ([]byte, error) {
+	frontmatter, err := json.Marshal(testFrontmatter{
+		ID: document.ID, Metadata: document.Metadata,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return JoinDocument(frontmatter, []byte(record.Body)), nil
+	return JoinDocument(frontmatter, []byte(document.Body)), nil
 }
 
-func testRecord(id, name, summary, body string) Record {
-	return Record{
-		ID: id, Repository: "lowply/example", Name: name, Summary: summary,
-		Body: body, SearchText: body, Status: "wip",
-		CreatedAt: "2026-08-31T00:00:00Z", UpdatedAt: "2026-08-31T00:00:00Z",
+func testConfig(root string) Config {
+	periodPattern := regexp.MustCompile(`\AFY[0-9]{2}H[12]\z`)
+	return Config{
+		Directory:    filepath.Join(root, "records"),
+		DatabasePath: filepath.Join(root, "records.db"),
+		Pattern:      "*.md", EntityName: "record", SchemaID: "test-record/1",
+		Fields: []MetadataField{
+			{Name: "period", Required: true, Validate: func(value string) error {
+				if !periodPattern.MatchString(value) {
+					return fmt.Errorf("invalid period %q", value)
+				}
+				return nil
+			}},
+			{Name: "repository"},
+			{Name: "name", Required: true},
+			{Name: "summary", Required: true},
+			{Name: "status", Required: true},
+			{Name: "created_at", Required: true},
+		},
+		SearchWeights: []float64{0.5, 1.0, 2.0, 1.0},
+		Codec:         testCodec{},
+	}
+}
+
+func testDocument(id, name, summary, body string) Document {
+	metadata := map[string]string{
+		"period": "FY27H1", "repository": "lowply/example", "name": name,
+		"summary": summary, "status": "wip", "created_at": "2026-08-31T00:00:00Z",
+	}
+	return Document{
+		ID: id, Metadata: metadata, Body: body, SortKey: metadata["created_at"],
+		SearchSlots: []string{metadata["repository"], name, summary, body},
 	}
 }
 
 func newTestStore(t *testing.T) (*Store, Config) {
 	t.Helper()
-	root := t.TempDir()
-	config := Config{
-		Directory:    filepath.Join(root, "records"),
-		DatabasePath: filepath.Join(root, "records.db"),
-		Pattern:      "*.md", Statuses: []string{"wip", "done"}, Codec: testCodec{},
-		EntityName: "record",
-	}
+	config := testConfig(t.TempDir())
 	store, err := Open(config)
 	if err != nil {
 		t.Fatal(err)
@@ -81,116 +99,280 @@ func newTestStore(t *testing.T) (*Store, Config) {
 	return store, config
 }
 
-func TestCreateFailsIfPathExists(t *testing.T) {
+func TestCreateAndGetRoundTripMetadata(t *testing.T) {
 	store, config := newTestStore(t)
 	path := filepath.Join(config.Directory, "record.md")
-	first := testRecord("first-id", "first", "First", "body")
-	if _, err := store.Create(path, first); err != nil {
+	document := testDocument("abc12345", "metadata", "Generic metadata", "body")
+	if _, err := store.Create(path, document); err != nil {
 		t.Fatal(err)
 	}
-	second := testRecord("second-id", "second", "Second", "replacement")
-	if _, err := store.Create(path, second); !errors.Is(err, ErrPathExists) {
-		t.Fatalf("error = %v, want ErrPathExists", err)
-	}
-	entry, err := store.Read(path)
+	result, err := store.Get("abc12345", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entry.ID != first.ID || entry.Body != first.Body {
-		t.Fatalf("existing record overwritten: %#v", entry)
+	if result.Metadata["period"] != "FY27H1" ||
+		result.Metadata["summary"] != "Generic metadata" ||
+		result.Path != path {
+		t.Fatalf("result = %#v", result)
 	}
 }
 
-func TestConcurrentCreatesPublishOnlyOneRecord(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	start := make(chan struct{})
-	var wait sync.WaitGroup
-	errs := make(chan error, 2)
-	for _, record := range []Record{
-		testRecord("first-id", "first", "First", "first"),
-		testRecord("second-id", "second", "Second", "second"),
-	} {
-		wait.Add(1)
-		go func(record Record) {
-			defer wait.Done()
-			<-start
-			_, err := store.Create(path, record)
-			errs <- err
-		}(record)
+func TestCreateRejectsMissingUnknownAndInvalidMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*Document)
+		want   string
+	}{
+		{name: "Missing", change: func(document *Document) {
+			delete(document.Metadata, "period")
+		}, want: "required metadata"},
+		{name: "Unknown", change: func(document *Document) {
+			document.Metadata["unexpected"] = "value"
+		}, want: "unknown metadata"},
+		{name: "Invalid", change: func(document *Document) {
+			document.Metadata["period"] = "FY27"
+		}, want: "invalid period"},
 	}
-	close(start)
-	wait.Wait()
-	close(errs)
-	successes := 0
-	existsErrors := 0
-	for err := range errs {
-		switch {
-		case err == nil:
-			successes++
-		case errors.Is(err, ErrPathExists):
-			existsErrors++
-		default:
-			t.Fatalf("unexpected create error: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, config := newTestStore(t)
+			document := testDocument("abc12345", "metadata", "Metadata", "body")
+			test.change(&document)
+			path := filepath.Join(config.Directory, "record.md")
+			if _, err := store.Create(path, document); err == nil ||
+				!strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid document was published: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsSearchSlotCount(t *testing.T) {
+	store, config := newTestStore(t)
+	document := testDocument("abc12345", "metadata", "Metadata", "body")
+	document.SearchSlots = document.SearchSlots[:3]
+	if _, err := store.Create(filepath.Join(config.Directory, "record.md"), document); err == nil ||
+		!strings.Contains(err.Error(), "search slots") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSearchCombinesExactMetadataFilters(t *testing.T) {
+	store, config := newTestStore(t)
+	first := testDocument("first-id", "first", "Shared work", "body")
+	second := testDocument("second-id", "second", "Shared work", "body")
+	second.Metadata["period"] = "FY27H2"
+	if _, err := store.Create(filepath.Join(config.Directory, "first.md"), first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(filepath.Join(config.Directory, "second.md"), second); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Search(SearchQuery{
+		Text: "Shared", Filters: map[string]string{"period": "FY27H1", "status": "wip"}, Limit: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ID != "first-id" {
+		t.Fatalf("results = %#v", results)
+	}
+}
+
+func TestSearchRejectsUnknownFilter(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.Search(SearchQuery{
+		Text: "anything", Filters: map[string]string{"unknown": "value"}, Limit: 5,
+	}); err == nil || !strings.Contains(err.Error(), "unknown metadata filter") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSearchUsesConfiguredSlotWeights(t *testing.T) {
+	store, config := newTestStore(t)
+	summaryMatch := testDocument("summary-id", "summary-match", "Critical migration", "ordinary body")
+	bodyMatch := testDocument("body-id", "body-match", "Ordinary summary", "Critical migration")
+	if _, err := store.Create(filepath.Join(config.Directory, "summary.md"), summaryMatch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(filepath.Join(config.Directory, "body.md"), bodyMatch); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Search(SearchQuery{Text: "Critical migration", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].ID != "summary-id" {
+		t.Fatalf("results = %#v", results)
+	}
+}
+
+func TestSearchExactIDIncludesRankAndFilters(t *testing.T) {
+	store, config := newTestStore(t)
+	document := testDocument("abc12345", "exact", "Exact", "body")
+	if _, err := store.Create(filepath.Join(config.Directory, "record.md"), document); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Search(SearchQuery{
+		Text: "abc12345", Filters: map[string]string{"period": "FY27H1"}, Limit: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].MatchReason != "id" || results[0].Rank != 0 {
+		t.Fatalf("results = %#v", results)
+	}
+	encoded, err := json.Marshal(results[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"rank":0`)) {
+		t.Fatalf("rank omitted: %s", encoded)
+	}
+}
+
+func TestListFiltersMetadataAndUsesSortKey(t *testing.T) {
+	store, config := newTestStore(t)
+	newer := testDocument("newer-id", "newer", "Newer", "body")
+	newer.SortKey = "2026-08-31T02:00:00Z"
+	newer.Metadata["created_at"] = newer.SortKey
+	older := testDocument("older-id", "older", "Older", "body")
+	older.SortKey = "2026-08-31T01:00:00Z"
+	older.Metadata["created_at"] = older.SortKey
+	other := testDocument("other-id", "other", "Other", "body")
+	other.Metadata["period"] = "FY27H2"
+	for path, document := range map[string]Document{
+		"newer.md": newer, "older.md": older, "other.md": other,
+	} {
+		if _, err := store.Create(filepath.Join(config.Directory, path), document); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if successes != 1 || existsErrors != 1 {
-		t.Fatalf("successes = %d, exists errors = %d", successes, existsErrors)
-	}
-}
-
-func TestUpdateSerializesLibraryMutations(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	if _, err := store.Create(path, testRecord("record-id", "record", "Record", "0")); err != nil {
-		t.Fatal(err)
-	}
-	start := make(chan struct{})
-	var wait sync.WaitGroup
-	for range 2 {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			<-start
-			_, err := store.Update(path, func(record Record) (Record, error) {
-				time.Sleep(20 * time.Millisecond)
-				if record.Body == "0" {
-					record.Body = "1"
-				} else {
-					record.Body = "2"
-				}
-				record.SearchText = record.Body
-				return record, nil
-			})
-			if err != nil {
-				t.Errorf("update: %v", err)
-			}
-		}()
-	}
-	close(start)
-	wait.Wait()
-	entry, err := store.Read(path)
+	results, err := store.List(map[string]string{"period": "FY27H1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entry.Body != "2" {
-		t.Fatalf("body = %q, want serialized updates to produce 2", entry.Body)
+	if len(results) != 2 || results[0].ID != "older-id" || results[1].ID != "newer-id" {
+		t.Fatalf("results = %#v", results)
 	}
 }
 
-func TestReconcileTracksEditsRenamesAndDeletes(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	if _, err := store.Create(path, testRecord("record-id", "record", "Initial summary", "Initial body")); err != nil {
+func TestOpenRebuildsIncompatibleIndexWithoutChangingMarkdown(t *testing.T) {
+	root := t.TempDir()
+	config := testConfig(root)
+	if err := os.MkdirAll(config.Directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	path := filepath.Join(config.Directory, "record.md")
+	writeTestDocument(t, path, testDocument("abc12345", "rebuild", "Rebuild index", "body"))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", config.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE obsolete(value TEXT); INSERT INTO obsolete VALUES('old')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := store.Get("abc12345", nil)
+	if err != nil || result.Path != path {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("canonical Markdown changed during index rebuild")
+	}
+}
+
+func TestOpenRebuildsMatchingFingerprintWithIncompleteSchema(t *testing.T) {
+	root := t.TempDir()
+	config := testConfig(root)
+	database, err := sql.Open("sqlite", config.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE markdownstore_config (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+		INSERT INTO markdownstore_config(key, value) VALUES('fingerprint', ?)`,
+		configFingerprint(config)); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var exists int
+	if err := store.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM sqlite_master
+		WHERE type = 'table' AND name = 'markdownstore_documents'
+	)`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("incomplete matching-fingerprint schema was not rebuilt")
+	}
+}
+
+func TestOpenRebuildsIndexWhenSchemaIDChanges(t *testing.T) {
+	root := t.TempDir()
+	config := testConfig(root)
+	store, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config.SchemaID = "test-record/2"
+	store, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var fingerprint string
+	if err := store.db.QueryRow(`SELECT value FROM markdownstore_config WHERE key = 'fingerprint'`).Scan(&fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if fingerprint != configFingerprint(config) {
+		t.Fatalf("fingerprint = %q", fingerprint)
+	}
+}
+
+func TestReconcileTracksDirectLifecycle(t *testing.T) {
+	store, config := newTestStore(t)
+	path := filepath.Join(config.Directory, "record.md")
+	writeTestDocument(t, path, testDocument("record-id", "record", "Initial", "body"))
 	if err := store.Reconcile(); err != nil {
 		t.Fatal(err)
 	}
 	assertSearchPath(t, store, "Initial", path)
 
-	updated := testRecord("record-id", "record", "Changed summary", "Changed body")
-	if _, err := store.Update(path, func(Record) (Record, error) { return updated, nil }); err != nil {
+	updated := testDocument("record-id", "record", "Changed", "body")
+	writeTestDocument(t, path, updated)
+	if err := store.Reconcile(); err != nil {
 		t.Fatal(err)
 	}
 	assertSearchPath(t, store, "Changed", path)
@@ -211,170 +393,170 @@ func TestReconcileTracksEditsRenamesAndDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.Search(SearchQuery{Text: "Changed", Limit: 5}); err == nil {
-		t.Fatal("deleted record remained searchable")
+		t.Fatal("deleted document remained searchable")
 	}
 }
 
-func TestReconcileDirectoryUsesExplicitCanonicalDirectory(t *testing.T) {
-	store, _ := newTestStore(t)
-	directory := t.TempDir()
-	path := filepath.Join(directory, "record.md")
-	writeTestDocument(t, path, testRecord("explicit-id", "explicit", "Explicit directory", "body"))
-	if err := store.ReconcileDirectory(directory); err != nil {
-		t.Fatal(err)
-	}
-	assertSearchPath(t, store, "Explicit", path)
-}
-
-func TestReplaceIndexRecordsAcceptsParsedEntries(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	writeTestDocument(t, path, testRecord("indexed-id", "indexed", "Indexed directly", "body"))
-	entry, err := store.Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ReplaceIndexRecords([]Entry{entry}, nil); err != nil {
-		t.Fatal(err)
-	}
-	assertSearchPath(t, store, "Indexed", path)
-}
-
-func TestReconcileRejectsMalformedAndDuplicateFilesWithoutMutation(t *testing.T) {
+func TestReconcileRejectsDuplicateIDsWithoutMutation(t *testing.T) {
 	store, config := newTestStore(t)
 	original := filepath.Join(config.Directory, "original.md")
-	if _, err := store.Create(original, testRecord("original", "original", "Original", "body")); err != nil {
+	writeTestDocument(t, original, testDocument("original-id", "original", "Original", "body"))
+	if err := store.Reconcile(); err != nil {
 		t.Fatal(err)
 	}
 	first := filepath.Join(config.Directory, "first.md")
 	second := filepath.Join(config.Directory, "second.md")
-	writeTestDocument(t, first, testRecord("duplicate", "first", "First", "body"))
-	writeTestDocument(t, second, testRecord("duplicate", "second", "Second", "body"))
-	bad := filepath.Join(config.Directory, "bad.md")
-	if err := os.WriteFile(bad, []byte("not a document"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Reconcile(); err == nil || !strings.Contains(err.Error(), bad) {
-		t.Fatalf("malformed error = %v", err)
-	}
-	assertSearchPath(t, store, "Original", original)
-	if err := os.Remove(bad); err != nil {
-		t.Fatal(err)
-	}
+	writeTestDocument(t, first, testDocument("duplicate", "first", "First", "body"))
+	writeTestDocument(t, second, testDocument("duplicate", "second", "Second", "body"))
 	if err := store.Reconcile(); err == nil ||
 		!strings.Contains(err.Error(), first) || !strings.Contains(err.Error(), second) {
-		t.Fatalf("duplicate error = %v", err)
-	}
-}
-
-func TestSearchExactIDIncludesDefinedRank(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	if _, err := store.Create(path, testRecord("abc12345", "record", "Summary", "body")); err != nil {
-		t.Fatal(err)
-	}
-	results, err := store.Search(SearchQuery{Text: "abc12345", Limit: 5})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 1 || results[0].MatchReason != "id" || results[0].Rank != 0 {
-		t.Fatalf("results = %#v", results)
-	}
-	encoded, err := json.Marshal(results[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(encoded, []byte(`"rank":0`)) {
-		t.Fatalf("exact result omitted rank: %s", encoded)
-	}
-}
-
-func TestOpenRejectsNewerSchemaBeforePersistentChanges(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "records.db")
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-		INSERT INTO schema_migrations(version, applied_at) VALUES(999, '2026-08-31T00:00:00Z');
-		PRAGMA journal_mode = DELETE`); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, err = Open(Config{
-		Directory: filepath.Join(root, "records"), DatabasePath: path,
-		Pattern: "*.md", Statuses: []string{"wip"}, Codec: testCodec{},
-	})
-	if err == nil || !strings.Contains(err.Error(), "newer than supported") {
 		t.Fatalf("error = %v", err)
 	}
-	info, statErr := os.Stat(path)
-	if statErr != nil {
-		t.Fatal(statErr)
+	assertSearchPath(t, store, "Original", original)
+}
+
+func TestConcurrentCreatesPublishOnePath(t *testing.T) {
+	store, config := newTestStore(t)
+	path := filepath.Join(config.Directory, "record.md")
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, document := range []Document{
+		testDocument("first-id", "first", "First", "body"),
+		testDocument("second-id", "second", "Second", "body"),
+	} {
+		wait.Add(1)
+		go func(document Document) {
+			defer wait.Done()
+			<-start
+			_, err := store.Create(path, document)
+			errs <- err
+		}(document)
 	}
-	if info.Mode().Perm() != 0o644 {
-		t.Fatalf("mode changed to %o before rejection", info.Mode().Perm())
+	close(start)
+	wait.Wait()
+	close(errs)
+	successes, exists := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrPathExists):
+			exists++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
 	}
-	database, err = sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	var journal string
-	if err := database.QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil {
-		t.Fatal(err)
-	}
-	if strings.EqualFold(journal, "wal") {
-		t.Fatalf("journal mode changed before rejection: %s", journal)
+	if successes != 1 || exists != 1 {
+		t.Fatalf("successes = %d, exists = %d", successes, exists)
 	}
 }
 
-func TestOpenMigratesLegacyProjectDoneStatusToClosed(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "project.db")
-	database, err := sql.Open("sqlite", path)
+func TestUpdateSerializesLibraryMutations(t *testing.T) {
+	store, config := newTestStore(t)
+	path := filepath.Join(config.Directory, "record.md")
+	if _, err := store.Create(path, testDocument("record-id", "record", "Record", "0")); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, err := store.Update(path, func(document Document) (Document, error) {
+				time.Sleep(20 * time.Millisecond)
+				if document.Body == "0" {
+					document.Body = "1"
+				} else {
+					document.Body = "2"
+				}
+				document.SearchSlots[3] = document.Body
+				return document, nil
+			})
+			if err != nil {
+				t.Errorf("update: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	entry, err := store.Read(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = database.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-		INSERT INTO schema_migrations(version, applied_at) VALUES(1, '2026-08-31T00:00:00Z');
-		CREATE TABLE projects (
-			path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, mod_time_ns INTEGER NOT NULL,
-			id TEXT NOT NULL UNIQUE, repository TEXT NOT NULL, name TEXT NOT NULL,
-			summary TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
-			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-		);
-		INSERT INTO projects VALUES(
-			'/tmp/legacy.md', 1, 1, 'abc12345', '', 'legacy', 'Legacy',
-			'body', 'done', '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z'
-		)`)
+	if entry.Body != "2" {
+		t.Fatalf("body = %q", entry.Body)
+	}
+}
+
+func TestCreateRejectsDuplicateIDWithoutPublishingFile(t *testing.T) {
+	store, config := newTestStore(t)
+	if _, err := store.Create(
+		filepath.Join(config.Directory, "first.md"),
+		testDocument("same-id", "first", "First", "body"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(config.Directory, "second.md")
+	if _, err := store.Create(second, testDocument("same-id", "second", "Second", "body")); !errors.Is(err, ErrIDExists) {
+		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Stat(second); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("duplicate file published: %v", err)
+	}
+}
+
+func TestUpdateRejectsIDChange(t *testing.T) {
+	store, config := newTestStore(t)
+	path := filepath.Join(config.Directory, "record.md")
+	if _, err := store.Create(path, testDocument("original-id", "record", "Record", "body")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Update(path, func(document Document) (Document, error) {
+		document.ID = "changed-id"
+		return document, nil
+	}); !errors.Is(err, ErrIDChanged) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRemoveRejectsReplacedDocument(t *testing.T) {
+	store, config := newTestStore(t)
+	path := filepath.Join(config.Directory, "record.md")
+	entry, err := store.Create(path, testDocument("record-id", "record", "Record", "body"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
+	writeTestDocument(t, path, testDocument("replacement", "replacement", "Replacement", "body"))
+	if err := store.Remove(path, entry.Fingerprint); !errors.Is(err, ErrChanged) {
+		t.Fatalf("error = %v", err)
 	}
-	store, err := Open(Config{
-		Directory: filepath.Join(root, "projects"), DatabasePath: path,
-		Pattern: "*.md", Statuses: []string{"wip", "closed"},
-		Codec: testCodec{}, EntityName: "project",
-	})
+}
+
+func TestStandaloneFileHelpers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "record.md")
+	document := testDocument("read-id", "read", "Read", "body")
+	data, err := (testCodec{}).Marshal(document)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	results, err := store.Search(SearchQuery{Text: "abc12345", Status: "closed", Limit: 5})
+	if err := CreateFileAtomic(path, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateFileAtomic(path, []byte("replacement")); !errors.Is(err, ErrPathExists) {
+		t.Fatalf("error = %v", err)
+	}
+	entry, err := ReadFile(path, testCodec{}, testConfig(t.TempDir()).Fields, []float64{0.5, 1, 2, 1}, "record")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].Status != "closed" {
-		t.Fatalf("results = %#v", results)
+	if entry.ID != document.ID {
+		t.Fatalf("entry = %#v", entry)
+	}
+	if err := WriteFileAtomic(path, data); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -385,13 +567,13 @@ func assertSearchPath(t *testing.T, store *Store, query, path string) {
 		t.Fatal(err)
 	}
 	if len(results) != 1 || results[0].Path != path {
-		t.Fatalf("results = %#v, want path %s", results, path)
+		t.Fatalf("results = %#v, want %s", results, path)
 	}
 }
 
-func writeTestDocument(t *testing.T, path string, record Record) {
+func writeTestDocument(t *testing.T, path string, document Document) {
 	t.Helper()
-	data, err := (testCodec{}).Marshal(record)
+	data, err := (testCodec{}).Marshal(document)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,122 +583,4 @@ func writeTestDocument(t *testing.T, path string, record Record) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestRemoveRejectsReplacedRecord(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	entry, err := store.Create(path, testRecord("record-id", "record", "Record", "body"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	replacement := testRecord("replacement-id", "replacement", "Replacement", "body")
-	writeTestDocument(t, path, replacement)
-	if err := store.Remove(path, entry.Fingerprint); !errors.Is(err, ErrChanged) {
-		t.Fatalf("error = %v, want ErrChanged", err)
-	}
-	got, err := store.Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ID != replacement.ID {
-		t.Fatalf("replacement removed: %#v", got)
-	}
-}
-
-func TestValidateConfigRequiresResolvedPathsAndCodec(t *testing.T) {
-	_, err := Open(Config{})
-	if err == nil || !strings.Contains(err.Error(), "directory") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestReadFileParsesWithoutOpeningDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "record.md")
-	writeTestDocument(t, path, testRecord("read-id", "read", "Read file", "body"))
-	entry, err := ReadFile(path, testCodec{}, []string{"wip", "done"}, "record")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if entry.ID != "read-id" || entry.Path != path {
-		t.Fatalf("entry = %#v", entry)
-	}
-}
-
-func TestWriteFileAtomicReplacesCanonicalBytes(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "record.md")
-	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteFileAtomic(path, []byte("new")); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "new" {
-		t.Fatalf("data = %q", data)
-	}
-}
-
-func TestCreateFileAtomicDoesNotReplaceExistingBytes(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "record.md")
-	if err := CreateFileAtomic(path, []byte("first")); err != nil {
-		t.Fatal(err)
-	}
-	if err := CreateFileAtomic(path, []byte("second")); !errors.Is(err, ErrPathExists) {
-		t.Fatalf("error = %v, want ErrPathExists", err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "first" {
-		t.Fatalf("data = %q", data)
-	}
-}
-
-func TestCreateRejectsDuplicateIDWithoutPublishingFile(t *testing.T) {
-	store, config := newTestStore(t)
-	firstPath := filepath.Join(config.Directory, "first.md")
-	secondPath := filepath.Join(config.Directory, "second.md")
-	if _, err := store.Create(firstPath, testRecord("same-id", "first", "First", "body")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Create(secondPath, testRecord("same-id", "second", "Second", "body")); !errors.Is(err, ErrIDExists) {
-		t.Fatalf("error = %v, want ErrIDExists", err)
-	}
-	if _, err := os.Stat(secondPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("duplicate canonical file was published: %v", err)
-	}
-}
-
-func TestUpdateRejectsIDChangeWithoutReplacingFile(t *testing.T) {
-	store, config := newTestStore(t)
-	path := filepath.Join(config.Directory, "record.md")
-	original, err := store.Create(path, testRecord("original-id", "record", "Record", "body"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.Update(path, func(record Record) (Record, error) {
-		record.ID = "changed-id"
-		record.Summary = "Changed"
-		return record, nil
-	})
-	if !errors.Is(err, ErrIDChanged) {
-		t.Fatalf("error = %v, want ErrIDChanged", err)
-	}
-	current, err := store.Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.ID != original.ID || current.Summary != original.Summary {
-		t.Fatalf("canonical record changed: %#v", current)
-	}
-}
-
-func ExampleSearchQuery() {
-	fmt.Println(SearchQuery{Text: "sqlite index", Status: "wip", Limit: 5}.Text)
-	// Output: sqlite index
 }

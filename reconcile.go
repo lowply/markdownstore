@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -105,10 +106,6 @@ func (s *Store) reconcileDirectory(directory string) error {
 	return s.replaceIndexRecords(changed, removed)
 }
 
-func (s *Store) ReplaceIndexRecords(changed []Entry, removed []string) error {
-	return s.replaceIndexRecords(changed, removed)
-}
-
 func removePath(paths []string, target string) []string {
 	for index, path := range paths {
 		if path == target {
@@ -119,7 +116,7 @@ func removePath(paths []string, target string) []string {
 }
 
 func (s *Store) indexedFiles() (map[string]indexedFile, error) {
-	rows, err := s.db.Query(`SELECT path, id, file_size, mod_time_ns FROM markdownstore_records`)
+	rows, err := s.db.Query(`SELECT path, id, file_size, mod_time_ns FROM markdownstore_documents`)
 	if err != nil {
 		return nil, fmt.Errorf("list indexed files: %w", err)
 	}
@@ -133,10 +130,7 @@ func (s *Store) indexedFiles() (map[string]indexedFile, error) {
 		}
 		result[path] = item
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list indexed files: %w", err)
-	}
-	return result, nil
+	return result, rows.Err()
 }
 
 func (s *Store) replaceIndexRecords(changed []Entry, removed []string) error {
@@ -144,27 +138,47 @@ func (s *Store) replaceIndexRecords(changed []Entry, removed []string) error {
 	if err != nil {
 		return fmt.Errorf("begin index update: %w", err)
 	}
+
 	defer tx.Rollback()
-	for _, path := range removed {
-		if _, err := tx.Exec(`DELETE FROM markdownstore_records WHERE path = ?`, path); err != nil {
+	for _, path := range append(append([]string{}, removed...), entryPaths(changed)...) {
+		if _, err := tx.Exec(`DELETE FROM markdownstore_fts WHERE path = ?`, path); err != nil {
+			return fmt.Errorf("remove indexed search document %s: %w", path, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM markdownstore_documents WHERE path = ?`, path); err != nil {
 			return fmt.Errorf("remove indexed document %s: %w", path, err)
 		}
 	}
 	for _, entry := range changed {
-		if _, err := tx.Exec(`DELETE FROM markdownstore_records WHERE path = ?`, entry.Path); err != nil {
-			return fmt.Errorf("replace indexed document %s: %w", entry.Path, err)
-		}
-	}
-	for _, entry := range changed {
-		_, err := tx.Exec(`INSERT INTO markdownstore_records(
-			path, file_size, mod_time_ns, id, repository, name, summary, body,
-			search_text, status, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		if _, err := tx.Exec(`INSERT INTO markdownstore_documents(
+			path, file_size, mod_time_ns, id, body, sort_key
+		) VALUES(?, ?, ?, ?, ?, ?)`,
 			entry.Path, entry.Fingerprint.Size, entry.Fingerprint.ModTimeNS,
-			entry.ID, entry.Repository, entry.Name, entry.Summary, entry.Body,
-			entry.SearchText, entry.Status, entry.CreatedAt, entry.UpdatedAt)
-		if err != nil {
+			entry.ID, entry.Body, entry.SortKey); err != nil {
 			return fmt.Errorf("index document %s: %w", entry.Path, err)
+		}
+		keys := make([]string, 0, len(entry.Metadata))
+		for key := range entry.Metadata {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if _, err := tx.Exec(`INSERT INTO markdownstore_metadata(document_path, key, value)
+				VALUES(?, ?, ?)`, entry.Path, key, entry.Metadata[key]); err != nil {
+				return fmt.Errorf("index metadata %s for %s: %w", key, entry.Path, err)
+			}
+		}
+		columns := []string{"path"}
+		placeholders := []string{"?"}
+		args := []any{entry.Path}
+		for index, value := range entry.SearchSlots {
+			columns = append(columns, "slot_"+strconv.Itoa(index))
+			placeholders = append(placeholders, "?")
+			args = append(args, value)
+		}
+		query := `INSERT INTO markdownstore_fts(` + strings.Join(columns, ",") + `)
+			VALUES(` + strings.Join(placeholders, ",") + `)`
+		if _, err := tx.Exec(query, args...); err != nil {
+			return fmt.Errorf("index search document %s: %w", entry.Path, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -173,17 +187,38 @@ func (s *Store) replaceIndexRecords(changed []Entry, removed []string) error {
 	return nil
 }
 
-func (s *Store) getByID(id string) (Result, error) {
+// ReplaceIndexRecords updates the derived index from already parsed canonical documents.
+func (s *Store) ReplaceIndexRecords(changed []Entry, removed []string) error {
+	return s.replaceIndexRecords(changed, removed)
+}
+
+func entryPaths(entries []Entry) []string {
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+	}
+	return paths
+}
+
+func (s *Store) getByID(id string, filters map[string]string) (Result, error) {
+	if err := s.validateFilters(filters); err != nil {
+		return Result{}, err
+	}
+	filterSQL, args := metadataFilters("d", filters)
+	queryArgs := []any{id}
+	queryArgs = append(queryArgs, args...)
 	var result Result
-	err := s.db.QueryRow(`SELECT id, repository, name, summary, status,
-		created_at, updated_at, path FROM markdownstore_records WHERE id = ?`, id).Scan(
-		&result.ID, &result.Repository, &result.Name, &result.Summary, &result.Status,
-		&result.CreatedAt, &result.UpdatedAt, &result.Path)
+	err := s.db.QueryRow(`SELECT d.id, d.path FROM markdownstore_documents d
+		WHERE d.id = ?`+filterSQL, queryArgs...).Scan(&result.ID, &result.Path)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Result{}, fmt.Errorf("no %s found with ID %q", s.config.EntityName, id)
 	}
 	if err != nil {
 		return Result{}, fmt.Errorf("get indexed %s: %w", s.config.EntityName, err)
+	}
+	result.Metadata, err = s.loadMetadata(result.Path)
+	if err != nil {
+		return Result{}, err
 	}
 	return result, nil
 }
@@ -196,54 +231,41 @@ func (s *Store) Search(query SearchQuery) ([]Result, error) {
 	if query.Limit < 1 || query.Limit > 100 {
 		return nil, fmt.Errorf("limit must be between 1 and 100")
 	}
-	if err := s.validateOptionalStatus(query.Status); err != nil {
+	if err := s.validateFilters(query.Filters); err != nil {
 		return nil, err
 	}
-	exactSQL := `SELECT id, repository, name, summary, status, created_at, updated_at, path
-		FROM markdownstore_records WHERE id = ?`
-	args := []any{text}
-	if query.Status != "" {
-		exactSQL += ` AND status = ?`
-		args = append(args, query.Status)
-	}
-	exactSQL += ` LIMIT ?`
-	args = append(args, query.Limit)
-	rows, err := s.db.Query(exactSQL, args...)
+	filterSQL, filterArgs := metadataFilters("d", query.Filters)
+	exactArgs := append([]any{text}, filterArgs...)
+	exactArgs = append(exactArgs, query.Limit)
+	rows, err := s.db.Query(`SELECT d.id, d.path FROM markdownstore_documents d
+		WHERE d.id = ?`+filterSQL+` LIMIT ?`, exactArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("search %s by ID: %w", s.config.EntityName, err)
 	}
-	exact, err := scanResults(rows, false)
+	exact, err := scanBaseResults(rows, false)
 	if err != nil {
 		return nil, err
 	}
 	if len(exact) > 0 {
 		for index := range exact {
 			exact[index].MatchReason = "id"
-			exact[index].Rank = 0
 		}
-		return exact, nil
+		return s.attachMetadata(exact)
 	}
 
 	fts := buildFTSQuery(text)
-	searchSQL := `SELECT r.id, r.repository, r.name, r.summary, r.status,
-			r.created_at, r.updated_at, r.path,
-			bm25(markdownstore_fts, 0.5, 1.0, 2.0, 1.0)
+	rank := bm25Expression(s.config.SearchWeights)
+	searchArgs := append([]any{fts}, filterArgs...)
+	searchArgs = append(searchArgs, query.Limit)
+	rows, err = s.db.Query(`SELECT d.id, d.path, `+rank+`
 		FROM markdownstore_fts
-		JOIN markdownstore_records r ON r.rowid = markdownstore_fts.rowid
-		WHERE markdownstore_fts MATCH ?`
-	args = []any{fts}
-	if query.Status != "" {
-		searchSQL += ` AND r.status = ?`
-		args = append(args, query.Status)
-	}
-	searchSQL += ` ORDER BY bm25(markdownstore_fts, 0.5, 1.0, 2.0, 1.0),
-		r.updated_at DESC LIMIT ?`
-	args = append(args, query.Limit)
-	rows, err = s.db.Query(searchSQL, args...)
+		JOIN markdownstore_documents d ON d.path = markdownstore_fts.path
+		WHERE markdownstore_fts MATCH ?`+filterSQL+`
+		ORDER BY `+rank+`, d.sort_key DESC LIMIT ?`, searchArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("search %s records: %w", s.config.EntityName, err)
 	}
-	results, err := scanResults(rows, true)
+	results, err := scanBaseResults(rows, true)
 	if err != nil {
 		return nil, err
 	}
@@ -253,61 +275,104 @@ func (s *Store) Search(query SearchQuery) ([]Result, error) {
 	for index := range results {
 		results[index].MatchReason = "full_text"
 	}
-	return results, nil
+	return s.attachMetadata(results)
 }
 
-func (s *Store) List(status string) ([]Result, error) {
-	if err := s.validateOptionalStatus(status); err != nil {
+func (s *Store) List(filters map[string]string) ([]Result, error) {
+	if err := s.validateFilters(filters); err != nil {
 		return nil, err
 	}
-	query := `SELECT id, repository, name, summary, status, created_at, updated_at, path
-		FROM markdownstore_records`
-	var args []any
-	if status != "" {
-		query += ` WHERE status = ?`
-		args = append(args, status)
-	}
-	query += ` ORDER BY created_at ASC, rowid ASC`
-	rows, err := s.db.Query(query, args...)
+	filterSQL, args := metadataFilters("d", filters)
+	rows, err := s.db.Query(`SELECT d.id, d.path FROM markdownstore_documents d
+		WHERE 1 = 1`+filterSQL+` ORDER BY d.sort_key ASC, d.rowid ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list %s records: %w", s.config.EntityName, err)
 	}
-	return scanResults(rows, false)
+	results, err := scanBaseResults(rows, false)
+	if err != nil {
+		return nil, err
+	}
+	return s.attachMetadata(results)
 }
 
-func scanResults(rows *sql.Rows, ranked bool) ([]Result, error) {
+func metadataFilters(alias string, filters map[string]string) (string, []any) {
+	keys := make([]string, 0, len(filters))
+	for key := range filters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var sqlBuilder strings.Builder
+	args := make([]any, 0, len(keys)*2)
+	for index, key := range keys {
+		metadataAlias := "m" + strconv.Itoa(index)
+		sqlBuilder.WriteString(` AND EXISTS (SELECT 1 FROM markdownstore_metadata `)
+		sqlBuilder.WriteString(metadataAlias)
+		sqlBuilder.WriteString(` WHERE `)
+		sqlBuilder.WriteString(metadataAlias)
+		sqlBuilder.WriteString(`.document_path = `)
+		sqlBuilder.WriteString(alias)
+		sqlBuilder.WriteString(`.path AND `)
+		sqlBuilder.WriteString(metadataAlias)
+		sqlBuilder.WriteString(`.key = ? AND `)
+		sqlBuilder.WriteString(metadataAlias)
+		sqlBuilder.WriteString(`.value = ?)`)
+		args = append(args, key, filters[key])
+	}
+	return sqlBuilder.String(), args
+}
+
+func bm25Expression(weights []float64) string {
+	values := []string{"0"}
+	for _, weight := range weights {
+		values = append(values, strconv.FormatFloat(weight, 'g', -1, 64))
+	}
+	return `bm25(markdownstore_fts, ` + strings.Join(values, ", ") + `)`
+}
+
+func scanBaseResults(rows *sql.Rows, ranked bool) ([]Result, error) {
 	defer rows.Close()
 	var results []Result
 	for rows.Next() {
 		var result Result
-		destinations := []any{
-			&result.ID, &result.Repository, &result.Name, &result.Summary,
-			&result.Status, &result.CreatedAt, &result.UpdatedAt, &result.Path,
-		}
 		if ranked {
-			destinations = append(destinations, &result.Rank)
-		}
-		if err := rows.Scan(destinations...); err != nil {
+			if err := rows.Scan(&result.ID, &result.Path, &result.Rank); err != nil {
+				return nil, fmt.Errorf("read search result: %w", err)
+			}
+		} else if err := rows.Scan(&result.ID, &result.Path); err != nil {
 			return nil, fmt.Errorf("read search result: %w", err)
 		}
 		results = append(results, result)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read search results: %w", err)
+	return results, rows.Err()
+}
+
+func (s *Store) attachMetadata(results []Result) ([]Result, error) {
+	for index := range results {
+		metadata, err := s.loadMetadata(results[index].Path)
+		if err != nil {
+			return nil, err
+		}
+		results[index].Metadata = metadata
 	}
 	return results, nil
 }
 
-func (s *Store) validateOptionalStatus(status string) error {
-	if status == "" {
-		return nil
+func (s *Store) loadMetadata(path string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT key, value FROM markdownstore_metadata
+		WHERE document_path = ? ORDER BY key`, path)
+	if err != nil {
+		return nil, fmt.Errorf("read indexed metadata: %w", err)
 	}
-	for _, allowed := range s.config.Statuses {
-		if status == allowed {
-			return nil
+	defer rows.Close()
+	metadata := make(map[string]string)
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, fmt.Errorf("read indexed metadata: %w", err)
 		}
+		metadata[key] = value
 	}
-	return fmt.Errorf("invalid status %q", status)
+	return metadata, rows.Err()
 }
 
 func buildFTSQuery(query string) string {

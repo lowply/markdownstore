@@ -8,16 +8,24 @@ import (
 	"path/filepath"
 )
 
-func ReadFile(path string, codec Codec, statuses []string, entityName string) (Entry, error) {
+func ReadFile(
+	path string,
+	codec Codec,
+	fields []MetadataField,
+	searchWeights []float64,
+	entityName string,
+) (Entry, error) {
 	if codec == nil {
 		return Entry{}, fmt.Errorf("markdownstore codec must not be nil")
 	}
-	if len(statuses) == 0 {
-		return Entry{}, fmt.Errorf("markdownstore statuses must not be empty")
+	fieldMap, err := buildFieldMap(fields)
+	if err != nil {
+		return Entry{}, err
 	}
-	store := &Store{config: Config{
-		Codec: codec, Statuses: statuses, EntityName: entityName,
-	}}
+	store := &Store{
+		config: Config{Codec: codec, Fields: fields, SearchWeights: searchWeights, EntityName: entityName},
+		fields: fieldMap,
+	}
 	if store.config.EntityName == "" {
 		store.config.EntityName = "document"
 	}
@@ -59,37 +67,29 @@ func CreateFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-func (s *Store) Create(path string, record Record) (Entry, error) {
+func (s *Store) Create(path string, document Document) (Entry, error) {
 	var result Entry
 	err := s.withMutationLock(func() error {
 		absolute, err := filepath.Abs(filepath.Clean(path))
 		if err != nil {
 			return fmt.Errorf("resolve canonical path: %w", err)
 		}
-		if err := s.validateRecord(record); err != nil {
+		if err := s.validateDocument(document); err != nil {
 			return err
 		}
-		exists, err := s.HasID(record.ID)
+		exists, err := s.HasID(document.ID)
 		if err != nil {
 			return err
 		}
 		if exists {
-			return fmt.Errorf("%w: %s", ErrIDExists, record.ID)
+			return fmt.Errorf("%w: %s", ErrIDExists, document.ID)
 		}
-		data, err := s.config.Codec.Marshal(record)
+		data, err := s.config.Codec.Marshal(document)
 		if err != nil {
 			return fmt.Errorf("marshal %s: %w", s.config.EntityName, err)
 		}
-		temporary, err := createTemporary(filepath.Dir(absolute), data)
-		if err != nil {
+		if err := CreateFileAtomic(absolute, data); err != nil {
 			return err
-		}
-		defer os.Remove(temporary)
-		if err := os.Link(temporary, absolute); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				return fmt.Errorf("%w: %s", ErrPathExists, absolute)
-			}
-			return fmt.Errorf("publish %s: %w", s.config.EntityName, err)
 		}
 		result, err = s.readStable(absolute)
 		if err != nil {
@@ -107,7 +107,7 @@ func (s *Store) Create(path string, record Record) (Entry, error) {
 	return result, err
 }
 
-func (s *Store) Update(path string, mutate func(Record) (Record, error)) (Entry, error) {
+func (s *Store) Update(path string, mutate func(Document) (Document, error)) (Entry, error) {
 	var result Entry
 	err := s.withMutationLock(func() error {
 		current, err := s.readStable(path)
@@ -118,14 +118,14 @@ func (s *Store) Update(path string, mutate func(Record) (Record, error)) (Entry,
 		if err != nil {
 			return fmt.Errorf("read original %s: %w", s.config.EntityName, err)
 		}
-		updated, err := mutate(current.Record)
+		updated, err := mutate(cloneDocument(current.Document))
 		if err != nil {
 			return err
 		}
 		if updated.ID != current.ID {
 			return fmt.Errorf("%w: %s", ErrIDChanged, current.Path)
 		}
-		if err := s.validateRecord(updated); err != nil {
+		if err := s.validateDocument(updated); err != nil {
 			return err
 		}
 		data, err := s.config.Codec.Marshal(updated)
@@ -141,7 +141,7 @@ func (s *Store) Update(path string, mutate func(Record) (Record, error)) (Entry,
 		if err != nil {
 			return err
 		}
-		if latest.Fingerprint != current.Fingerprint || !equalRecord(latest.Record, current.Record) {
+		if latest.Fingerprint != current.Fingerprint || !equalDocument(latest.Document, current.Document) {
 			return fmt.Errorf("%w while updating %s: %s", ErrChanged, s.config.EntityName, current.Path)
 		}
 		if err := os.Rename(temporary, current.Path); err != nil {
@@ -175,7 +175,7 @@ func (s *Store) Remove(path string, expected Fingerprint) error {
 		if err != nil {
 			return err
 		}
-		if latest.Fingerprint != current.Fingerprint || !equalRecord(latest.Record, current.Record) {
+		if latest.Fingerprint != current.Fingerprint || !equalDocument(latest.Document, current.Document) {
 			return fmt.Errorf("%w before removing %s: %s", ErrChanged, s.config.EntityName, current.Path)
 		}
 		if err := os.Remove(current.Path); err != nil {
@@ -249,11 +249,11 @@ func (s *Store) readOnce(path string) (Entry, error) {
 	if err != nil {
 		return Entry{}, fmt.Errorf("parse %s: %w", absolute, err)
 	}
-	record, err := s.config.Codec.Parse(absolute, frontmatter, body)
+	document, err := s.config.Codec.Parse(absolute, frontmatter, body)
 	if err != nil {
 		return Entry{}, fmt.Errorf("parse %s: %w", absolute, err)
 	}
-	if err := s.validateRecord(record); err != nil {
+	if err := s.validateDocument(document); err != nil {
 		return Entry{}, fmt.Errorf("parse %s: %w", absolute, err)
 	}
 	after, err := file.Stat()
@@ -268,8 +268,7 @@ func (s *Store) readOnce(path string) (Entry, error) {
 		return Entry{}, fmt.Errorf("%w while reading %s", ErrChanged, absolute)
 	}
 	return Entry{
-		Record:      record,
-		Path:        absolute,
+		Document: document, Path: absolute,
 		Fingerprint: Fingerprint{Size: after.Size(), ModTimeNS: after.ModTime().UnixNano()},
 	}, nil
 }
